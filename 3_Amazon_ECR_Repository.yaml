@@ -1,0 +1,14 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sentia Technical Assessment. Create AWS ECR Repository used for hold images.
+
+Parameters:
+    RepositoryName:
+        Type: String
+Resources:
+    MyRepository: 
+        Type: AWS::ECR::Repository
+        Properties: 
+            RepositoryName: !Ref RepositoryName
+Outputs:    
+  Arn:
+    Value: !GetAtt MyRepository.Arn

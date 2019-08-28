@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Sentia Technical Assessment. RDS MySQL DB for Wordpress application with multi
+  AZ.
+Parameters:
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: VpcId of your existing Virtual Private Cloud
+  Subnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: >-
+      The list of SubnetIds, for at least two Availability Zones in the region
+      in your Virtual Private Cloud
+  ServiceName:
+    Type: String
+    Description: A name for the service
+  Path:
+    Type: String
+    Default: '*'
+    Description: >-
+      A path on the public load balancer that this service should be connected
+      to. Use * to send all load balancer traffic to this service.
+  Priority:
+    Type: Number
+    Default: 1
+    Description: >-
+      The priority for the routing rule added to the load balancer. This only
+      applies if your have multiple services which have been assigned to
+      different paths on the load balancer.
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How much memory in megabytes to give the container
+  Role:
+    Type: String
+    Default: ''
+    Description: >-
+      (Optional) An IAM role to give the service's containers if the code within
+      needs to access other AWS resources like S3 buckets, DynamoDB tables, etc
+  ImageUrl:
+    Type: String
+    Default: 'wordpress:latest'
+    Description: >-
+      The url of a docker image that contains the application process that will
+      handle the traffic for this service
+  ContainerPort:
+    Type: Number
+    Default: 80
+    Description: What port number the application inside the docker container is binding to
+  ECSClusterName:
+    Type: String
+    Description: ECS Cluster Name
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: How many copies of the service task to run
+Conditions:
+  HasCustomRole: !Not 
+    - !Equals 
+      - !Ref Role
+      - ''
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ECSClusterName
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the Fargate containers
+      VpcId: !Ref 'VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: 'tcp'
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+          
+        - IpProtocol: 'tcp'
+          FromPort: '1'
+          ToPort: '65535'
+          SourceSecurityGroupId: !Ref 'PublicLoadBalancerSG'  
+  PublicLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer
+      VpcId: !Ref 'VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: 'tcp'
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      Name: !Ref 'ServiceName'
+      Port: '80'
+      TargetType: ip
+      Protocol: HTTP
+      Tags:
+        -
+          Key: 'Name'
+          Value: !Join [' ', ['ECS', !Ref 'ServiceName', '-', 'TargetGroup']]
+        -
+          Key: 'Description'
+          Value: !Join [' ', ['Created for ECS cluster', !Ref 'ServiceName']]
+  EcsElasticLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      SecurityGroups:
+        - !Ref PublicLoadBalancerSG
+      Subnets: !Ref Subnets
+      Scheme: internet-facing
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - ' '
+            - - ECS
+              - !Ref ServiceName
+              - '-'
+              - ALB
+        - Key: Description
+          Value: !Join 
+            - ' '
+            - - Created for ECS cluster
+              - !Ref ServiceName
+  LoadBalancerListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      LoadBalancerArn: !Ref EcsElasticLoadBalancer
+      Port: '80'
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DefaultTargetGroup
+  LoadBalancerRule:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref DefaultTargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - !Ref Path
+      ListenerArn: !Ref LoadBalancerListener
+      Priority: !Ref Priority
+  TaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: !Ref ServiceName
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn:
+        'Fn::If':
+          - HasCustomRole
+          - !Ref Role
+          - !Ref 'AWS::NoValue'
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Cpu: !Ref ContainerCpu
+          Memory: !Ref ContainerMemory
+          Image: !Ref ImageUrl
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+  Service:
+    Type: 'AWS::ECS::Service'
+    DependsOn: LoadBalancerRule
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref ECSClusterName
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: !Ref DesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref FargateContainerSecurityGroup
+          Subnets: !Ref Subnets
+      TaskDefinition: !Ref TaskDefinition
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref DefaultTargetGroup
+  ECSRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:AttachNetworkInterface'
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:CreateNetworkInterfacePermission'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:DeleteNetworkInterfacePermission'
+                  - 'ec2:Describe*'
+                  - 'ec2:DetachNetworkInterface'
+                  - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                  - 'elasticloadbalancing:RegisterTargets'
+                Resource: '*'
+  ECSTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+Outputs:
+  ExternalUrl:
+    Description: The url of the external load balancer
+    Value: !Sub 'http://${EcsElasticLoadBalancer.DNSName}'
+    Export:
+      Name: ExternalUrl
